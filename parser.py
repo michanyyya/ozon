@@ -6,7 +6,7 @@ import os
 from datetime import datetime
 
 # ========== НАСТРОЙКИ ==========
-TELEGRAM_TOKEN = "8647208789:AAHbaUUUxIi_M-ROAR1ldZ1cmd2Frk17j-o"
+TELEGRAM_TOKEN = "8647208789:AAHO_bvEcYvT1B_o9OMJsXecFSMnfRNooPk"
 TELEGRAM_CHAT_ID = "babatum001"
 
 PRODUCTS = [
