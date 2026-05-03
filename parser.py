@@ -9,7 +9,7 @@ import threading
 import random
 
 # ========== НАСТРОЙКИ ==========
-TELEGRAM_TOKEN = "8647208789:AAHO_bvEcYvT1B_o9OMJsXecFSMnfRNooPk"  # ЗАМЕНИ НА НОВЫЙ
+TELEGRAM_TOKEN = "8647208789:AAHO_bvEcYvT1B_o9OMJsXecFSMnfRNooPk"
 TELEGRAM_CHAT_ID = "babatum001"
 
 PRODUCTS = [
@@ -19,11 +19,9 @@ PRODUCTS = [
 
 ALERT_MEMORY_FILE = "sent_alerts.json"
 
-# Список разных User-Agent для ротации
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
 ]
 
 def get_headers():
@@ -31,13 +29,7 @@ def get_headers():
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Cache-Control": "max-age=0",
         "Referer": "https://www.ozon.ru/"
     }
 
@@ -57,7 +49,8 @@ def send_telegram_message(text):
     try:
         r = requests.post(url, json=payload, timeout=10)
         return r.ok
-    except:
+    except Exception as e:
+        print(f"Ошибка отправки: {e}")
         return False
 
 def search_ozon(query, max_pages=2):
@@ -66,58 +59,31 @@ def search_ozon(query, max_pages=2):
     
     for page in range(1, max_pages + 1):
         url = f"https://www.ozon.ru/search/?text={query}&page={page}"
-        
         try:
-            print(f"  Запрос страницы {page}...")
+            print(f"  Страница {page}...")
             response = session.get(url, headers=get_headers(), timeout=20)
             
-            if response.status_code == 403:
-                print(f"  Блокировка 403, пробуем другой User-Agent...")
-                # Пауза подольше
-                time.sleep(5)
+            if response.status_code != 200:
+                print(f"  Ошибка {response.status_code}")
                 continue
                 
-            response.raise_for_status()
-            
             soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Пробуем разные селекторы
             cards = soup.select('[data-testid="grid-cell"]')
+            
             if not cards:
                 cards = soup.select('div[class*="tile"]')
-            if not cards:
-                cards = soup.select('div[data-index]')
-            
-            print(f"  Найдено карточек: {len(cards)}")
             
             for card in cards:
-                # Ищем цену разными способами
-                price_str = None
-                price_selectors = [
-                    'span[class*="final"]',
-                    'span[class*="price"]',
-                    'div[class*="price"] span',
-                    'span[data-testid="price-current"]',
-                    'span[class*="c3a1"]'
-                ]
-                
-                for sel in price_selectors:
-                    elem = card.select_one(sel)
-                    if elem:
-                        price_str = elem.get_text(strip=True)
-                        break
-                
-                if not price_str:
+                price_elem = card.select_one('span[class*="price"]') or card.select_one('div[class*="price"] span')
+                if not price_elem:
                     continue
                 
-                # Извлекаем число
                 import re
-                digits = re.findall(r'\d+', price_str.replace(' ', ''))
+                digits = re.findall(r'\d+', price_elem.get_text().replace(' ', ''))
                 if not digits:
                     continue
                 price = int(''.join(digits))
                 
-                # Ссылка
                 link = card.select_one('a')
                 if link and link.get('href'):
                     href = link.get('href')
@@ -125,25 +91,22 @@ def search_ozon(query, max_pages=2):
                         href = 'https://www.ozon.ru' + href
                     results.append({"price": price, "url": href})
             
-            time.sleep(random.uniform(2, 4))  # случайная задержка
-            
+            time.sleep(random.uniform(1, 2))
         except Exception as e:
-            print(f"  Ошибка страницы {page}: {e}")
+            print(f"  Ошибка: {e}")
             continue
     
-    # Убираем дубликаты по url
     unique = []
     seen = set()
     for item in results:
         if item['url'] not in seen:
             seen.add(item['url'])
             unique.append(item)
-    
     return unique
 
 def run_parser():
     print(f"\n{'='*50}")
-    print(f"Запуск: {datetime.now()}")
+    print(f"Запуск: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*50}")
     
     sent = load_sent_alerts()
@@ -153,11 +116,11 @@ def run_parser():
         items = search_ozon(p['search'])
         
         if not items:
-            print(f"  Не найдено товаров")
+            print(f"  Товаров не найдено")
             continue
         
         items.sort(key=lambda x: x['price'])
-        print(f"  Самая низкая цена: {items[0]['price']} руб")
+        print(f"  Мин. цена: {items[0]['price']} руб")
         
         found = None
         for item in items:
@@ -175,14 +138,13 @@ def run_parser():
             else:
                 print(f"  ⏩ Уже уведомляли")
         else:
-            # Сбрасываем флаги, если вышли из диапазона
             sent = [k for k in sent if not k.startswith(p['name'])]
-            print(f"  ❌ Товаров в диапазоне нет")
+            print(f"  ❌ Нет товаров в диапазоне")
     
     save_sent_alerts(sent)
-    print(f"\nГотово: {datetime.now()}")
+    print(f"\nГотово: {datetime.now().strftime('%H:%M:%S')}")
 
-# ========== ВЕБ-СЕРВЕР ==========
+# ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/run':
@@ -196,7 +158,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b'OK')
     
     def log_message(self, format, *args):
-        pass  # отключаем лишний лог
+        pass
 
 def start_webserver():
     port = int(os.environ.get('PORT', 8000))
@@ -204,12 +166,15 @@ def start_webserver():
     server.serve_forever()
 
 if __name__ == "__main__":
+    # Запускаем веб-сервер
     threading.Thread(target=start_webserver, daemon=True).start()
-    print(f"Сервер запущен на порту {os.environ.get('PORT', 8000)}")
     
-    # При первом запуске сразу проверим
-    run_parser()
+    print(f"✅ Парсер запущен!")
+    print(f"📍 Адрес: https://ozon-mfq9.onrender.com")
+    print(f"⏰ Проверка цен каждый час")
     
-    # Держим процесс живым
+    # Запускаем бесконечный цикл проверки
     while True:
-        time.sleep(60)
+        run_parser()
+        print("\n⏳ Жду 1 час до следующей проверки...\n")
+        time.sleep(3600)  # 1 час
