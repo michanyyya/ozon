@@ -1,30 +1,3 @@
-"""Ozon price monitor
-
-Checks a list of Ozon product pages and notifies when the current price
-falls inside a configured range.
-
-Usage examples:
-
-1) Edit TARGETS below and run:
-   python ozon_price_monitor.py
-
-2) Or p([docs.ozon.ru](https://docs.ozon.ru/global/en/api/?utm_source=chatgpt.com))e_monitor.py --csv targets.csv
-
-CSV format:
-   url,min_price,max_price,name
-   https://www.ozon.ru/product/....,1000,2500,Headphones
-
-Optional Telegram notifications:
-   export TELEGRAM_BOT_TOKEN=...
-   export TELEGRAM_CHAT_ID=...
-
-Notes:
-- This script prefers parsing JSON-LD / embedded page data from the public
-  product page.
-- Ozon page structure can change, so the parser includes several fallbacks.
-- Use a reasonable polling interval to avoid hammering the site.
-"""
-
 from __future__ import annotations
 
 import argparse
