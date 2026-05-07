@@ -249,14 +249,10 @@ def send_telegram(message: str) -> None:
 
 def format_alert(target: Target, result: PriceResult) -> str:
     return (
-        f"Keyword: {target.keyword}
-"
-        f"Title: {result.title}
-"
-        f"Price: {result.price} {result.currency}
-"
-        f"Range: {target.min_price} - {target.max_price}
-"
+        f"Keyword: {target.keyword}\n"
+        f"Title: {result.title}\n"
+        f"Price: {result.price} {result.currency}\n"
+        f"Range: {target.min_price} - {target.max_price}\n"
         f"Link: {result.url}"
     )
 
