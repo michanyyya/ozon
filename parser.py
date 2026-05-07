@@ -1,180 +1,368 @@
-import requests
-from bs4 import BeautifulSoup
-import time
+"""Ozon price monitor
+
+Checks a list of Ozon product pages and notifies when the current price
+falls inside a configured range.
+
+Usage examples:
+
+1) Edit TARGETS below and run:
+   python ozon_price_monitor.py
+
+2) Or p([docs.ozon.ru](https://docs.ozon.ru/global/en/api/?utm_source=chatgpt.com))e_monitor.py --csv targets.csv
+
+CSV format:
+   url,min_price,max_price,name
+   https://www.ozon.ru/product/....,1000,2500,Headphones
+
+Optional Telegram notifications:
+   export TELEGRAM_BOT_TOKEN=...
+   export TELEGRAM_CHAT_ID=...
+
+Notes:
+- This script prefers parsing JSON-LD / embedded page data from the public
+  product page.
+- Ozon page structure can change, so the parser includes several fallbacks.
+- Use a reasonable polling interval to avoid hammering the site.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
 import json
 import os
-from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
-import random
+import re
+import sys
+import time
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from typing import Iterable, Optional
+from urllib.parse import quote_plus, urlparse
 
-# ========== НАСТРОЙКИ ==========
-TELEGRAM_TOKEN = "8647208789:AAHO_bvEcYvT1B_o9OMJsXecFSMnfRNooPk"
-TELEGRAM_CHAT_ID = "babatum001"
+import requests
+from bs4 import BeautifulSoup
 
-PRODUCTS = [
-    {"name": "Алиса Мини 3", "search": "алиса мини 3", "price_min": 6000, "price_max": 8000},
-    {"name": "Алиса Миди", "search": "алиса миди", "price_min": 10000, "price_max": 12000}
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
+
+DEFAULT_INTERVAL_SECONDS = 300
+DEFAULT_TIMEOUT = 20
+DEFAULT_CURRENCY = "RUB"
+SEARCH_BASE_URL = "https://www.ozon.ru/search/?text="
+
+KEYWORDS = [
+    "Алиса Миди",
+    "Алиса Мини 3",
+    "Алиса Станция 3",
+    "Алиса Мини 3 Про",
 ]
 
-ALERT_MEMORY_FILE = "sent_alerts.json"
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-]
+@dataclass
+class Target:
+    keyword: str
+    min_price: Decimal
+    max_price: Decimal
 
-def get_headers():
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Connection": "keep-alive",
-        "Referer": "https://www.ozon.ru/"
-    }
 
-def load_sent_alerts():
-    if os.path.exists(ALERT_MEMORY_FILE):
-        with open(ALERT_MEMORY_FILE, 'r') as f:
-            return json.load(f)
-    return []
+@dataclass
+class PriceResult:
+    title: str
+    price: Decimal
+    currency: str
+    url: str
 
-def save_sent_alerts(alerts):
-    with open(ALERT_MEMORY_FILE, 'w') as f:
-        json.dump(alerts, f, indent=2)
 
-def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+def normalize_decimal(value: str | float | int | Decimal) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    text = str(value).strip().replace(" ", "").replace(",", ".")
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        return r.ok
-    except Exception as e:
-        print(f"Ошибка отправки: {e}")
-        return False
+        return Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(f"Cannot parse decimal value: {value!r}") from exc
 
-def search_ozon(query, max_pages=2):
-    results = []
-    session = requests.Session()
-    
-    for page in range(1, max_pages + 1):
-        url = f"https://www.ozon.ru/search/?text={query}&page={page}"
+
+def load_targets_from_csv(path: str) -> list[Target]:
+    targets: list[Target] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"keyword", "min_price", "max_price"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(
+                f"CSV must contain columns: {', '.join(sorted(required))}. "
+                f"Got: {reader.fieldnames}"
+            )
+
+        for row in reader:
+            targets.append(
+                Target(
+                    keyword=row["keyword"].strip(),
+                    min_price=normalize_decimal(row["min_price"]),
+                    max_price=normalize_decimal(row["max_price"]),
+                )
+            )
+    return targets
+
+
+def build_search_url(keyword: str) -> str:
+    return SEARCH_BASE_URL + quote_plus(keyword)
+
+
+def infer_name_from_url(url: str) -> str:
+    try:
+        path = urlparse(url).path.rstrip("/")
+        tail = path.split("/")[-1]
+        return tail or url
+    except Exception:
+        return url
+
+
+JSON_LD_PRICE_PATTERNS = [
+    re.compile(r'"price"\s*:\s*"?(\d+(?:[\.,]\d+)?)"?', re.IGNORECASE),
+    re.compile(r'"lowPrice"\s*:\s*"?(\d+(?:[\.,]\d+)?)"?', re.IGNORECASE),
+]
+
+
+def fetch_html(session: requests.Session, url: str, timeout: int = DEFAULT_TIMEOUT) -> str:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    }
+    resp = session.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
+
+
+def extract_from_json_ld(html: str, page_url: str) -> Optional[PriceResult]:
+    soup = BeautifulSoup(html, "html.parser")
+    scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
+    for script in scripts:
+        text = script.string or script.get_text(strip=True)
+        if not text:
+            continue
         try:
-            print(f"  Страница {page}...")
-            response = session.get(url, headers=get_headers(), timeout=20)
-            
-            if response.status_code != 200:
-                print(f"  Ошибка {response.status_code}")
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        candidates: list[dict] = []
+        if isinstance(data, dict):
+            candidates.append(data)
+            if "@graph" in data and isinstance(data["@graph"], list):
+                candidates.extend([x for x in data["@graph"] if isinstance(x, dict)])
+        elif isinstance(data, list):
+            candidates.extend([x for x in data if isinstance(x, dict)])
+
+        for item in candidates:
+            if item.get("@type") not in {"Product", "Offer", "AggregateOffer"}:
                 continue
-                
-            soup = BeautifulSoup(response.text, 'html.parser')
-            cards = soup.select('[data-testid="grid-cell"]')
-            
-            if not cards:
-                cards = soup.select('div[class*="tile"]')
-            
-            for card in cards:
-                price_elem = card.select_one('span[class*="price"]') or card.select_one('div[class*="price"] span')
-                if not price_elem:
-                    continue
-                
-                import re
-                digits = re.findall(r'\d+', price_elem.get_text().replace(' ', ''))
-                if not digits:
-                    continue
-                price = int(''.join(digits))
-                
-                link = card.select_one('a')
-                if link and link.get('href'):
-                    href = link.get('href')
-                    if href.startswith('/'):
-                        href = 'https://www.ozon.ru' + href
-                    results.append({"price": price, "url": href})
-            
-            time.sleep(random.uniform(1, 2))
-        except Exception as e:
-            print(f"  Ошибка: {e}")
+
+            title = (
+                item.get("name")
+                or item.get("title")
+                or infer_name_from_url(page_url)
+            )
+
+            offers = item.get("offers")
+            if isinstance(offers, dict):
+                price = offers.get("price") or offers.get("lowPrice") or offers.get("highPrice")
+                currency = offers.get("priceCurrency") or DEFAULT_CURRENCY
+                if price is not None:
+                    return PriceResult(title=str(title), price=normalize_decimal(price), currency=str(currency), url=page_url)
+            elif isinstance(offers, list) and offers:
+                for offer in offers:
+                    if not isinstance(offer, dict):
+                        continue
+                    price = offer.get("price") or offer.get("lowPrice") or offer.get("highPrice")
+                    if price is not None:
+                        currency = offer.get("priceCurrency") or DEFAULT_CURRENCY
+                        return PriceResult(title=str(title), price=normalize_decimal(price), currency=str(currency), url=page_url)
+
+    return None
+
+
+def extract_from_embedded_json(html: str, page_url: str) -> Optional[PriceResult]:
+    # Generic fallback for embedded state data.
+    soup = BeautifulSoup(html, "html.parser")
+    text_chunks: list[str] = []
+    for script in soup.find_all("script"):
+        text = script.string or script.get_text(strip=True)
+        if text:
+            text_chunks.append(text)
+
+    joined = "\n".join(text_chunks)
+    price = None
+    for pattern in JSON_LD_PRICE_PATTERNS:
+        m = pattern.search(joined)
+        if m:
+            price = normalize_decimal(m.group(1))
+            break
+    if price is None:
+        return None
+
+    title = infer_name_from_url(page_url)
+    title_match = re.search(r'"name"\s*:\s*"([^"]{3,200})"', joined)
+    if title_match:
+        title = title_match.group(1)
+
+    currency = DEFAULT_CURRENCY
+    cur_match = re.search(r'"priceCurrency"\s*:\s*"([A-Z]{3})"', joined)
+    if cur_match:
+        currency = cur_match.group(1)
+
+    return PriceResult(title=title, price=price, currency=currency, url=page_url)
+
+
+def extract_price(session: requests.Session, url: str) -> PriceResult:
+    html = fetch_html(session, url)
+
+    result = extract_from_json_ld(html, url)
+    if result:
+        return result
+
+    result = extract_from_embedded_json(html, url)
+    if result:
+        return result
+
+    raise RuntimeError(f"Could not find price on page: {url}")
+
+
+def extract_product_links(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+
+        if "/product/" not in href:
             continue
-    
-    unique = []
-    seen = set()
-    for item in results:
-        if item['url'] not in seen:
-            seen.add(item['url'])
-            unique.append(item)
-    return unique
 
-def run_parser():
-    print(f"\n{'='*50}")
-    print(f"Запуск: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*50}")
-    
-    sent = load_sent_alerts()
-    
-    for p in PRODUCTS:
-        print(f"\n--- {p['name']} ---")
-        items = search_ozon(p['search'])
-        
-        if not items:
-            print(f"  Товаров не найдено")
-            continue
-        
-        items.sort(key=lambda x: x['price'])
-        print(f"  Мин. цена: {items[0]['price']} руб")
-        
-        found = None
-        for item in items:
-            if p['price_min'] <= item['price'] <= p['price_max']:
-                found = item
-                break
-        
-        if found:
-            key = f"{p['name']}_{found['url']}"
-            if key not in sent:
-                msg = f"🔔 <b>{p['name']}</b>\n💰 Цена: {found['price']} ₽\n📊 Диапазон: {p['price_min']} - {p['price_max']} ₽\n🔗 {found['url']}"
-                send_telegram_message(msg)
-                sent.append(key)
-                print(f"  ✅ Уведомление отправлено!")
-            else:
-                print(f"  ⏩ Уже уведомляли")
-        else:
-            sent = [k for k in sent if not k.startswith(p['name'])]
-            print(f"  ❌ Нет товаров в диапазоне")
-    
-    save_sent_alerts(sent)
-    print(f"\nГотово: {datetime.now().strftime('%H:%M:%S')}")
+        if href.startswith("/"):
+            href = "https://www.ozon.ru" + href
 
-# ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/run':
-            threading.Thread(target=run_parser).start()
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'Parser started')
-        else:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'OK')
-    
-    def log_message(self, format, *args):
-        pass
+        href = href.split("?")[0]
+        links.add(href)
 
-def start_webserver():
-    port = int(os.environ.get('PORT', 8000))
-    server = HTTPServer(('0.0.0.0', port), Handler)
-    server.serve_forever()
+    return list(links)
+
+
+def search_products(session: requests.Session, keyword: str) -> list[str]:
+    url = build_search_url(keyword)
+    html = fetch_html(session, url)
+    return extract_product_links(html)
+
+
+def in_range(price: Decimal, min_price: Decimal, max_price: Decimal) -> bool:
+    return min_price <= price <= max_price
+
+
+def send_telegram(message: str) -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "disable_web_page_preview": False}
+    resp = requests.post(url, json=payload, timeout=20)
+    resp.raise_for_status()
+
+
+def format_alert(target: Target, result: PriceResult) -> str:
+    return (
+        f"Keyword: {target.keyword}
+"
+        f"Title: {result.title}
+"
+        f"Price: {result.price} {result.currency}
+"
+        f"Range: {target.min_price} - {target.max_price}
+"
+        f"Link: {result.url}"
+    )
+
+
+def check_targets(targets: Iterable[Target]) -> list[str]:
+    alerts: list[str] = []
+    session = requests.Session()
+
+    for target in targets:
+        try:
+            product_links = search_products(session, target.keyword)
+
+            if not product_links:
+                print(f"[EMPTY] {target.keyword}: no products found")
+                continue
+
+            for link in product_links[:10]:
+                try:
+                    result = extract_price(session, link)
+
+                    title_lower = result.title.lower()
+                    keyword_lower = target.keyword.lower()
+
+                    if keyword_lower not in title_lower:
+                        continue
+
+                    if in_range(result.price, target.min_price, target.max_price):
+                        alerts.append(format_alert(target, result))
+                        print(f"[MATCH] {result.title}: {result.price} {result.currency}")
+                    else:
+                        print(f"[SKIP] {result.title}: {result.price} {result.currency}")
+
+                except Exception as item_exc:
+                    print(f"[ERR] Product parse error: {item_exc}")
+
+        except Exception as exc:
+            print(f"[ERR] {target.keyword}: {exc}", file=sys.stderr)
+
+    return alerts
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Monitor Ozon product prices")
+    p.add_argument("--csv", help="Path to CSV with keyword,min_price,max_price")
+    p.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="Polling interval in seconds")
+    p.add_argument("--once", action="store_true", help="Run one check and exit")
+    return p.parse_args()
+
+
+TARGETS: list[Target] = [
+    Target(keyword="Алиса Миди", min_price=Decimal("5000"), max_price=Decimal("15000")),
+    Target(keyword="Алиса Мини 3", min_price=Decimal("4000"), max_price=Decimal("12000")),
+    Target(keyword="Алиса Станция 3", min_price=Decimal("10000"), max_price=Decimal("25000")),
+    Target(keyword="Алиса Мини 3 Про", min_price=Decimal("7000"), max_price=Decimal("18000")),
+]
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.csv:
+        targets = load_targets_from_csv(args.csv)
+    else:
+        if not TARGETS:
+            print("No targets configured. Edit TARGETS in the script or pass --csv.", file=sys.stderr)
+            return 1
+        targets = TARGETS
+
+    while True:
+        alerts = check_targets(targets)
+        for message in alerts:
+            print("\n" + message + "\n")
+            send_telegram(message)
+
+        if args.once:
+            return 0
+
+        time.sleep(max(10, args.interval))
+
 
 if __name__ == "__main__":
-    # Запускаем веб-сервер
-    threading.Thread(target=start_webserver, daemon=True).start()
-    
-    print(f"✅ Парсер запущен!")
-    print(f"📍 Адрес: https://ozon-mfq9.onrender.com")
-    print(f"⏰ Проверка цен каждый час")
-    
-    # Запускаем бесконечный цикл проверки
-    while True:
-        run_parser()
-        print("\n⏳ Жду 1 час до следующей проверки...\n")
-        time.sleep(3600)  # 1 час
+    raise SystemExit(main())
