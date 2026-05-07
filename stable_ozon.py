@@ -1,5 +1,4 @@
 import asyncio
-import json
 import re
 from playwright.async_api import async_playwright
 from tenacity import retry, stop_after_attempt, wait_fixed
@@ -21,82 +20,94 @@ class OzonClient:
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
 
     # =========================
-    # JSON EXTRACTION CORE
+    # DETECTION HELPERS
     # =========================
 
-    def extract_json_from_html(self, html: str):
-
-        # ищем большие JSON блоки (Next.js / __NEXT_DATA__)
-        match = re.search(
-            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-            html,
-            re.DOTALL
-        )
-
-        if not match:
-            return None
-
-        try:
-            return json.loads(match.group(1))
-        except:
-            return None
+    def is_blocked(self, html: str):
+        blocked_signs = [
+            "captcha",
+            "robot",
+            "access denied",
+            "доступ ограничен"
+        ]
+        return any(x in html.lower() for x in blocked_signs)
 
     # =========================
-    # PARSE PRODUCTS FROM JSON
+    # FALLBACK TEXT PARSER
     # =========================
 
-    def find_products(self, data):
+    def parse_from_text(self, html: str):
 
-        results = []
+        items = []
 
-        def walk(obj):
+        # ищем цены
+        prices = re.findall(r"(\d[\d\s]{2,})\s?₽", html)
 
-            if isinstance(obj, dict):
+        # ищем названия (очень грубо, но работает как fallback)
+        titles = re.findall(r'\"title\":\"(.*?)\"', html)
 
-                # Ozon product structure variations
-                if "title" in obj and ("price" in obj or "offer" in obj):
+        for i in range(min(len(prices), len(titles))):
+            try:
+                price = int(prices[i].replace(" ", ""))
+                title = titles[i][:120]
 
-                    title = obj.get("title")
+                items.append({
+                    "title": title,
+                    "price": price,
+                    "link": "https://www.ozon.ru"
+                })
+            except:
+                continue
 
-                    price = None
+        return items
 
-                    # разные варианты структуры цены
-                    if isinstance(obj.get("price"), dict):
-                        price = obj["price"].get("value")
+    # =========================
+    # UI PARSER (MAIN)
+    # =========================
 
-                    if isinstance(obj.get("offer"), dict):
-                        price = obj["offer"].get("price")
+    def parse_ui(self, page):
 
-                    if price and title:
+        items = []
 
-                        link = obj.get("link") or obj.get("url") or ""
+        cards = page.locator("div[data-widget='searchResultsV2'] a")
 
-                        results.append({
-                            "title": title,
-                            "price": int(price),
-                            "link": "https://www.ozon.ru" + link if link.startswith("/") else link
-                        })
+        count = cards.count()
 
-                for v in obj.values():
-                    walk(v)
+        for i in range(min(count, 10)):
+            try:
+                card = cards.nth(i)
 
-            elif isinstance(obj, list):
-                for i in obj:
-                    walk(i)
+                text = card.inner_text()
 
-        walk(data)
+                if "₽" not in text:
+                    continue
 
-        return results
+                price_match = re.search(r"(\d[\d\s]+)\s?₽", text)
+                price = int(price_match.group(1).replace(" ", "")) if price_match else 0
+
+                link = card.get_attribute("href")
+
+                items.append({
+                    "title": text[:120],
+                    "price": price,
+                    "link": "https://www.ozon.ru" + (link or "")
+                })
+
+            except:
+                continue
+
+        return items
 
     # =========================
     # MAIN FETCH
     # =========================
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(3))
     async def fetch(self, query: str):
 
         context = await self.browser.new_context(
@@ -114,22 +125,36 @@ class OzonClient:
 
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(6000)
 
         html = await page.content()
 
-        data = self.extract_json_from_html(html)
+        # =========================
+        # BLOCK DETECTION
+        # =========================
 
-        if not data:
-            print("❌ No JSON found (possible block or layout change)")
+        if self.is_blocked(html):
+            print("🚨 BLOCK DETECTED")
             await context.close()
             return []
 
-        products = self.find_products(data)
+        # =========================
+        # TRY UI PARSING FIRST
+        # =========================
+
+        items = self.parse_ui(page)
+
+        # =========================
+        # FALLBACK IF EMPTY
+        # =========================
+
+        if not items:
+            print("⚠️ UI empty → fallback parser")
+            items = self.parse_from_text(html)
 
         await context.close()
 
-        return products
+        return items
 
     async def close(self):
         await self.browser.close()
