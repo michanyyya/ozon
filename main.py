@@ -7,6 +7,7 @@ import requests
 TOKEN = "YOUR_TOKEN"
 CHAT_ID = "YOUR_CHAT_ID"
 
+send("TEST MESSAGE FROM BOT")
 
 TARGETS = [
     {
