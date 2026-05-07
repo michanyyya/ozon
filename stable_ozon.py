@@ -1,8 +1,11 @@
 import asyncio
+import json
+import re
 from playwright.async_api import async_playwright
 from tenacity import retry, stop_after_attempt, wait_fixed
 
-BASE_URL = "https://www.ozon.ru/search/?text={}"
+
+BASE_URL = "https://www.ozon.ru/search/?text={query}"
 
 
 class OzonClient:
@@ -12,6 +15,7 @@ class OzonClient:
 
     async def start(self):
         p = await async_playwright().start()
+
         self.browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -20,8 +24,81 @@ class OzonClient:
             ],
         )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(3))
+    # =========================
+    # JSON EXTRACTION CORE
+    # =========================
+
+    def extract_json_from_html(self, html: str):
+
+        # ищем большие JSON блоки (Next.js / __NEXT_DATA__)
+        match = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+            html,
+            re.DOTALL
+        )
+
+        if not match:
+            return None
+
+        try:
+            return json.loads(match.group(1))
+        except:
+            return None
+
+    # =========================
+    # PARSE PRODUCTS FROM JSON
+    # =========================
+
+    def find_products(self, data):
+
+        results = []
+
+        def walk(obj):
+
+            if isinstance(obj, dict):
+
+                # Ozon product structure variations
+                if "title" in obj and ("price" in obj or "offer" in obj):
+
+                    title = obj.get("title")
+
+                    price = None
+
+                    # разные варианты структуры цены
+                    if isinstance(obj.get("price"), dict):
+                        price = obj["price"].get("value")
+
+                    if isinstance(obj.get("offer"), dict):
+                        price = obj["offer"].get("price")
+
+                    if price and title:
+
+                        link = obj.get("link") or obj.get("url") or ""
+
+                        results.append({
+                            "title": title,
+                            "price": int(price),
+                            "link": "https://www.ozon.ru" + link if link.startswith("/") else link
+                        })
+
+                for v in obj.values():
+                    walk(v)
+
+            elif isinstance(obj, list):
+                for i in obj:
+                    walk(i)
+
+        walk(data)
+
+        return results
+
+    # =========================
+    # MAIN FETCH
+    # =========================
+
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
     async def fetch(self, query: str):
+
         context = await self.browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent=(
@@ -33,44 +110,26 @@ class OzonClient:
 
         page = await context.new_page()
 
-        await page.goto(
-            BASE_URL.format(query),
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        url = BASE_URL.format(query=query)
 
-        await page.wait_for_timeout(4000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        # проверка что страница реально загрузилась
-        if "captcha" in page.url.lower():
-            raise Exception("Blocked by captcha")
+        await page.wait_for_timeout(5000)
 
-        items = await page.locator("div[data-index]").all()
+        html = await page.content()
 
-        results = []
+        data = self.extract_json_from_html(html)
 
-        for item in items[:10]:
-            try:
-                title = await item.locator("span").first.inner_text()
-                price_text = await item.locator("span").filter(
-                    has_text="₽"
-                ).first.inner_text()
+        if not data:
+            print("❌ No JSON found (possible block or layout change)")
+            await context.close()
+            return []
 
-                price = int("".join(filter(str.isdigit, price_text)))
-
-                link = await item.locator("a").first.get_attribute("href")
-
-                results.append({
-                    "title": title,
-                    "price": price,
-                    "link": "https://www.ozon.ru" + link
-                })
-
-            except:
-                continue
+        products = self.find_products(data)
 
         await context.close()
-        return results
+
+        return products
 
     async def close(self):
         await self.browser.close()
